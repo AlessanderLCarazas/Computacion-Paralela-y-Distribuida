@@ -12,246 +12,377 @@
 using namespace std;
 using namespace std::chrono;
 
-#define MAX_LINE 1000
-#define MAX_TOKENS 100
+const int BUFFER_SIZE = 1000;
+const int TOKEN_LIMIT = 100;
 
-// variables globales
-int thread_count;
-sem_t* sems;
-FILE* input_file;
-pthread_mutex_t file_mutex = PTHREAD_MUTEX_INITIALIZER;
-
-// estadisticas globales
-int total_lines_processed = 0;
-int total_tokens_found = 0;
-pthread_mutex_t stats_mutex = PTHREAD_MUTEX_INITIALIZER;
-
-// estructura para datos del thread
-struct thread_data_s {
-    int thread_id;
-    int lines_processed;
-    int tokens_found;
+//    Clase para gestionar recursos de archivo   
+class FileManager {
+private:
+    FILE* fileHandle;
+    pthread_mutex_t accessLock;
+    
+public:
+    FileManager() : fileHandle(nullptr) {
+        pthread_mutex_init(&accessLock, nullptr);
+    }
+    
+    ~FileManager() {
+        if (fileHandle) fclose(fileHandle);
+        pthread_mutex_destroy(&accessLock);
+    }
+    
+    bool openFile(const char* path) {
+        if (fileHandle) fclose(fileHandle);
+        fileHandle = fopen(path, "r");
+        return fileHandle != nullptr;
+    }
+    
+    char* readLineWithLock(char* buffer, int size) {
+        pthread_mutex_lock(&accessLock);
+        char* result = fgets(buffer, size, fileHandle);
+        pthread_mutex_unlock(&accessLock);
+        return result;
+    }
+    
+    char* readLineUnsafe(char* buffer, int size) {
+        return fgets(buffer, size, fileHandle);
+    }
+    
+    void closeFile() {
+        if (fileHandle) {
+            fclose(fileHandle);
+            fileHandle = nullptr;
+        }
+    }
+    
+    FILE* getHandle() { return fileHandle; }
 };
 
-// ==================== implementacion 1: con semaforos (thread-safe) ====================
+//    Clase para estadísticas   
+class Statistics {
+private:
+    int linesCount;
+    int tokensCount;
+    pthread_mutex_t statLock;
+    
+public:
+    Statistics() : linesCount(0), tokensCount(0) {
+        pthread_mutex_init(&statLock, nullptr);
+    }
+    
+    ~Statistics() {
+        pthread_mutex_destroy(&statLock);
+    }
+    
+    void addCountsSafe(int lines, int tokens) {
+        pthread_mutex_lock(&statLock);
+        linesCount += lines;
+        tokensCount += tokens;
+        pthread_mutex_unlock(&statLock);
+    }
+    
+    void addCountsUnsafe(int lines, int tokens) {
+        linesCount += lines;
+        tokensCount += tokens;
+    }
+    
+    void reset() {
+        pthread_mutex_lock(&statLock);
+        linesCount = 0;
+        tokensCount = 0;
+        pthread_mutex_unlock(&statLock);
+    }
+    
+    int getLines() { return linesCount; }
+    int getTokens() { return tokensCount; }
+};
 
-void* Tokenize_Semaphore(void* rank) {
-    long my_rank = (long) rank;
-    int count;
-    int next = (my_rank + 1) % thread_count;
-    char* fg_rv;
-    char my_line[MAX_LINE];
-    char* my_string;
-    int local_lines = 0;
-    int local_tokens = 0;
+//    Clase para coordinar con semáforos   
+class SemaphoreCoordinator {
+private:
+    sem_t* semaphores;
+    int numSemaphores;
     
-    sem_wait(&sems[my_rank]);
-    fg_rv = fgets(my_line, MAX_LINE, input_file);
-    sem_post(&sems[next]);
+public:
+    SemaphoreCoordinator(int count) : numSemaphores(count) {
+        semaphores = new sem_t[numSemaphores];
+        for (int i = 0; i < numSemaphores; i++) {
+            sem_init(&semaphores[i], 0, 0);
+        }
+        sem_post(&semaphores[0]);
+    }
     
-    while (fg_rv != nullptr) {
-        local_lines++;
-        
-        count = 0;
-        my_string = strtok(my_line, " \t\n");
-        while (my_string != nullptr) {
+    ~SemaphoreCoordinator() {
+        for (int i = 0; i < numSemaphores; i++) {
+            sem_destroy(&semaphores[i]);
+        }
+        delete[] semaphores;
+    }
+    
+    void waitTurn(int index) {
+        sem_wait(&semaphores[index]);
+    }
+    
+    void signalNext(int index) {
+        int nextIndex = (index + 1) % numSemaphores;
+        sem_post(&semaphores[nextIndex]);
+    }
+};
+
+//    Estructura para resultados de thread   
+struct WorkerResult {
+    int workerId;
+    int processedLines;
+    int discoveredTokens;
+};
+
+//    Clase base para estrategias de tokenización   
+class TokenizationStrategy {
+protected:
+    FileManager* fileMgr;
+    Statistics* stats;
+    int workerCount;
+    
+    int parseTokens(char* line) {
+        int count = 0;
+        char* token = strtok(line, " \t\n");
+        while (token != nullptr) {
             count++;
-            local_tokens++;
-            my_string = strtok(nullptr, " \t\n");
+            token = strtok(nullptr, " \t\n");
+        }
+        return count;
+    }
+    
+public:
+    TokenizationStrategy(FileManager* fm, Statistics* st, int wc) 
+        : fileMgr(fm), stats(st), workerCount(wc) {}
+    
+    virtual void* execute(int workerId) = 0;
+    virtual ~TokenizationStrategy() {}
+};
+
+//    Estrategia con semáforos   
+class SemaphoreStrategy : public TokenizationStrategy {
+private:
+    SemaphoreCoordinator* coordinator;
+    
+public:
+    SemaphoreStrategy(FileManager* fm, Statistics* st, int wc, SemaphoreCoordinator* coord)
+        : TokenizationStrategy(fm, st, wc), coordinator(coord) {}
+    
+    void* execute(int workerId) override {
+        char lineBuffer[BUFFER_SIZE];
+        int linesProcessed = 0;
+        int tokensFound = 0;
+        
+        coordinator->waitTurn(workerId);
+        char* readResult = fgets(lineBuffer, BUFFER_SIZE, fileMgr->getHandle());
+        coordinator->signalNext(workerId);
+        
+        while (readResult != nullptr) {
+            linesProcessed++;
+            tokensFound += parseTokens(lineBuffer);
+            
+            coordinator->waitTurn(workerId);
+            readResult = fgets(lineBuffer, BUFFER_SIZE, fileMgr->getHandle());
+            coordinator->signalNext(workerId);
         }
         
-        sem_wait(&sems[my_rank]);
-        fg_rv = fgets(my_line, MAX_LINE, input_file);
-        sem_post(&sems[next]);
+        stats->addCountsSafe(linesProcessed, tokensFound);
+        
+        WorkerResult* result = new WorkerResult;
+        result->workerId = workerId;
+        result->processedLines = linesProcessed;
+        result->discoveredTokens = tokensFound;
+        
+        return (void*)result;
     }
-    
-    // actualizar estadisticas globales
-    pthread_mutex_lock(&stats_mutex);
-    total_lines_processed += local_lines;
-    total_tokens_found += local_tokens;
-    pthread_mutex_unlock(&stats_mutex);
-    
-    // almacenar datos del thread
-    struct thread_data_s* data = new thread_data_s;
-    data->thread_id = my_rank;
-    data->lines_processed = local_lines;
-    data->tokens_found = local_tokens;
-    
-    return (void*)data;
-}
+};
 
-// ==================== implementacion 2: con mutex (thread-safe alternativo) ====================
-
-void* Tokenize_Mutex(void* rank) {
-    long my_rank = (long) rank;
-    int count;
-    char* fg_rv;
-    char my_line[MAX_LINE];
-    char* my_string;
-    int local_lines = 0;
-    int local_tokens = 0;
+//    Estrategia con mutex   
+class MutexStrategy : public TokenizationStrategy {
+public:
+    MutexStrategy(FileManager* fm, Statistics* st, int wc)
+        : TokenizationStrategy(fm, st, wc) {}
     
-    while (true) {
-        // leer linea con proteccion mutex
-        pthread_mutex_lock(&file_mutex);
-        fg_rv = fgets(my_line, MAX_LINE, input_file);
-        pthread_mutex_unlock(&file_mutex);
+    void* execute(int workerId) override {
+        char lineBuffer[BUFFER_SIZE];
+        int linesProcessed = 0;
+        int tokensFound = 0;
         
-        if (fg_rv == nullptr) break;
-        
-        local_lines++;
-        
-        // tokenizar linea (no necesita sincronizacion)
-        count = 0;
-        my_string = strtok(my_line, " \t\n");
-        while (my_string != nullptr) {
-            count++;
-            local_tokens++;
-            my_string = strtok(nullptr, " \t\n");
+        while (true) {
+            char* readResult = fileMgr->readLineWithLock(lineBuffer, BUFFER_SIZE);
+            
+            if (readResult == nullptr) break;
+            
+            linesProcessed++;
+            tokensFound += parseTokens(lineBuffer);
         }
+        
+        stats->addCountsSafe(linesProcessed, tokensFound);
+        
+        WorkerResult* result = new WorkerResult;
+        result->workerId = workerId;
+        result->processedLines = linesProcessed;
+        result->discoveredTokens = tokensFound;
+        
+        return (void*)result;
     }
-    
-    // actualizar estadisticas globales
-    pthread_mutex_lock(&stats_mutex);
-    total_lines_processed += local_lines;
-    total_tokens_found += local_tokens;
-    pthread_mutex_unlock(&stats_mutex);
-    
-    // almacenar datos del thread
-    struct thread_data_s* data = new thread_data_s;
-    data->thread_id = my_rank;
-    data->lines_processed = local_lines;
-    data->tokens_found = local_tokens;
-    
-    return (void*)data;
-}
+};
 
-// ==================== implementacion 3: sin sincronizacion (race conditions) ====================
-
-void* Tokenize_Unsafe(void* rank) {
-    long my_rank = (long) rank;
-    int count;
-    char* fg_rv;
-    char my_line[MAX_LINE];
-    char* my_string;
-    int local_lines = 0;
-    int local_tokens = 0;
+//    Estrategia sin sincronización   
+class UnsafeStrategy : public TokenizationStrategy {
+public:
+    UnsafeStrategy(FileManager* fm, Statistics* st, int wc)
+        : TokenizationStrategy(fm, st, wc) {}
     
-    while (true) {
-        // leer linea SIN proteccion (race condition)
-        fg_rv = fgets(my_line, MAX_LINE, input_file);
+    void* execute(int workerId) override {
+        char lineBuffer[BUFFER_SIZE];
+        int linesProcessed = 0;
+        int tokensFound = 0;
         
-        if (fg_rv == nullptr) break;
-        
-        local_lines++;
-        
-        // tokenizar linea
-        count = 0;
-        my_string = strtok(my_line, " \t\n");
-        while (my_string != nullptr) {
-            count++;
-            local_tokens++;
-            my_string = strtok(nullptr, " \t\n");
+        while (true) {
+            char* readResult = fileMgr->readLineUnsafe(lineBuffer, BUFFER_SIZE);
+            
+            if (readResult == nullptr) break;
+            
+            linesProcessed++;
+            tokensFound += parseTokens(lineBuffer);
         }
+        
+        stats->addCountsUnsafe(linesProcessed, tokensFound);
+        
+        WorkerResult* result = new WorkerResult;
+        result->workerId = workerId;
+        result->processedLines = linesProcessed;
+        result->discoveredTokens = tokensFound;
+        
+        return (void*)result;
     }
-    
-    // actualizar estadisticas SIN proteccion (race condition)
-    total_lines_processed += local_lines;
-    total_tokens_found += local_tokens;
-    
-    // almacenar datos del thread
-    struct thread_data_s* data = new thread_data_s;
-    data->thread_id = my_rank;
-    data->lines_processed = local_lines;
-    data->tokens_found = local_tokens;
-    
-    return (void*)data;
+};
+
+//    Contexto para threads   
+struct WorkerContext {
+    int id;
+    TokenizationStrategy* strategy;
+};
+
+void* workerThreadFunction(void* arg) {
+    WorkerContext* ctx = (WorkerContext*)arg;
+    return ctx->strategy->execute(ctx->id);
 }
 
-// ==================== funciones auxiliares ====================
-
-// crear archivo de prueba
-void Create_test_file(const char* filename, int num_lines) {
-    ofstream file(filename);
-    string words[] = {"hello", "world", "thread", "safety", "parallel", "computing", 
-                     "synchronization", "mutex", "semaphore", "race", "condition"};
-    int num_words = 11;
-    
-    srand(time(nullptr));
-    
-    for (int i = 0; i < num_lines; i++) {
-        int tokens_per_line = 3 + rand() % 5; // 3-7 tokens per line
-        for (int j = 0; j < tokens_per_line; j++) {
-            file << words[rand() % num_words];
-            if (j < tokens_per_line - 1) file << " ";
+//    Generador de datos de prueba   
+class TestDataGenerator {
+public:
+    void generateFile(const char* filename, int numLines) {
+        ofstream output(filename);
+        string vocabulary[] = {"hello", "world", "thread", "safety", "parallel", 
+                              "computing", "synchronization", "mutex", "semaphore", 
+                              "race", "condition"};
+        int vocabSize = 11;
+        
+        srand(time(nullptr));
+        
+        for (int line = 0; line < numLines; line++) {
+            int wordsInLine = 3 + rand() % 5;
+            for (int word = 0; word < wordsInLine; word++) {
+                output << vocabulary[rand() % vocabSize];
+                if (word < wordsInLine - 1) output << " ";
+            }
+            output << endl;
         }
-        file << endl;
+        
+        output.close();
     }
-    
-    file.close();
-}
+};
 
-// inicializar semaforos
-void Initialize_semaphores() {
-    sems = new sem_t[thread_count];
-    for (int i = 0; i < thread_count; i++) {
-        sem_init(&sems[i], 0, 0);
+//    Executor de pruebas   
+class BenchmarkExecutor {
+private:
+    FileManager* fileMgr;
+    Statistics* stats;
+    int workerCount;
+    
+public:
+    BenchmarkExecutor(FileManager* fm, Statistics* st, int wc)
+        : fileMgr(fm), stats(st), workerCount(wc) {}
+    
+    double runBenchmark(TokenizationStrategy* strategy, const char* strategyName) {
+        pthread_t* workers = new pthread_t[workerCount];
+        WorkerResult* results[workerCount];
+        WorkerContext* contexts = new WorkerContext[workerCount];
+        
+        stats->reset();
+        fileMgr->openFile("test_input.txt");
+        
+        for (int i = 0; i < workerCount; i++) {
+            contexts[i].id = i;
+            contexts[i].strategy = strategy;
+        }
+        
+        auto startTime = high_resolution_clock::now();
+        
+        for (int i = 0; i < workerCount; i++) {
+            pthread_create(&workers[i], nullptr, workerThreadFunction, &contexts[i]);
+        }
+        
+        for (int i = 0; i < workerCount; i++) {
+            pthread_join(workers[i], (void**)&results[i]);
+        }
+        
+        auto endTime = high_resolution_clock::now();
+        auto elapsed = duration_cast<microseconds>(endTime - startTime);
+        
+        displayResults(strategyName, elapsed.count() / 1000.0);
+        
+        for (int i = 0; i < workerCount; i++) {
+            delete results[i];
+        }
+        delete[] workers;
+        delete[] contexts;
+        
+        return elapsed.count() / 1000000.0;
     }
-    sem_post(&sems[0]); // thread 0 comienza
-}
+    
+    void displayResults(const char* name, double timeMs) {
+        cout << "| " << setw(20) << name << " |";
+        cout << setw(8) << stats->getLines() << " |";
+        cout << setw(9) << stats->getTokens() << " |";
+        cout << fixed << setprecision(3) << setw(8) << timeMs << " |" << endl;
+    }
+};
 
-// limpiar semaforos
-void Cleanup_semaphores() {
-    for (int i = 0; i < thread_count; i++) {
-        sem_destroy(&sems[i]);
+//    Presentador de resultados   
+class ResultPresenter {
+public:
+    void showHeader(int workers, int lines) {
+        cout << "\n=== analisis de thread safety - tokenizacion de strings ===" << endl;
+        cout << "threads: " << workers << ", lineas de entrada: " << lines << endl;
+        cout << "comparacion de implementaciones thread-safe vs unsafe" << endl;
+        cout << "\n";
+        
+        cout << "      =================" << endl;
+        cout << "|     Implementacion       | Lineas  | Tokens  | Tiempo  |" << endl;
+        cout << "|                          |Proces.  |Encontr. |  (ms)   |" << endl;
+        cout << "|--------------------------|---------|---------|---------|" << endl;
     }
-    delete[] sems;
-}
+    
+    void showFooter() {
+        cout << "      =================" << endl;
+        cout << "\nanalisis de resultados:" << endl;
+        cout << "- implementaciones thread-safe garantizan resultados correctos" << endl;
+        cout << "- implementacion unsafe puede mostrar race conditions" << endl;
+        cout << "- semaforos permiten acceso secuencial ordenado" << endl;
+        cout << "- mutex permite acceso exclusivo pero sin orden garantizado" << endl;
+        cout << "\nnotas sobre thread safety:" << endl;
+        cout << "1. race conditions ocurren cuando threads acceden simultaneamente" << endl;
+        cout << "2. sincronizacion agrega overhead pero garantiza correctness" << endl;
+        cout << "3. semaforos vs mutex: diferentes estrategias de coordinacion" << endl;
+    }
+};
 
-// ejecutar prueba
-double Run_test(void* (*thread_func)(void*), const char* test_name) {
-    pthread_t* thread_handles = new pthread_t[thread_count];
-    struct thread_data_s* thread_results[thread_count];
-    
-    // resetear estadisticas
-    total_lines_processed = 0;
-    total_tokens_found = 0;
-    
-    // reabrir archivo
-    if (input_file) fclose(input_file);
-    input_file = fopen("test_input.txt", "r");
-    
-    auto start = high_resolution_clock::now();
-    
-    // crear threads
-    for (long thread = 0; thread < thread_count; thread++) {
-        pthread_create(&thread_handles[thread], nullptr, thread_func, (void*)thread);
-    }
-    
-    // esperar threads
-    for (int thread = 0; thread < thread_count; thread++) {
-        pthread_join(thread_handles[thread], (void**)&thread_results[thread]);
-    }
-    
-    auto end = high_resolution_clock::now();
-    auto duration = duration_cast<microseconds>(end - start);
-    
-    cout << "| " << setw(20) << test_name << " |";
-    cout << setw(8) << total_lines_processed << " |";
-    cout << setw(9) << total_tokens_found << " |";
-    cout << fixed << setprecision(3) << setw(8) << (duration.count() / 1000.0) << " |" << endl;
-    
-    // limpiar memoria
-    for (int i = 0; i < thread_count; i++) {
-        delete thread_results[i];
-    }
-    delete[] thread_handles;
-    
-    return duration.count() / 1000000.0;
-}
-
-// ==================== funcion principal ====================
-
+//    Función principal   
 int main(int argc, char* argv[]) {
     if (argc != 3) {
         cout << "uso: " << argv[0] << " <num_threads> <num_lineas>" << endl;
@@ -259,47 +390,29 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     
-    thread_count = strtol(argv[1], nullptr, 10);
-    int num_lines = strtol(argv[2], nullptr, 10);
+    int workerCount = strtol(argv[1], nullptr, 10);
+    int lineCount = strtol(argv[2], nullptr, 10);
     
-    cout << "\n=== analisis de thread safety - tokenizacion de strings ===" << endl;
-    cout << "threads: " << thread_count << ", lineas de entrada: " << num_lines << endl;
-    cout << "comparacion de implementaciones thread-safe vs unsafe" << endl;
-    cout << "\n";
+    ResultPresenter presenter;
+    presenter.showHeader(workerCount, lineCount);
     
-    // crear archivo de prueba
-    Create_test_file("test_input.txt", num_lines);
+    TestDataGenerator generator;
+    generator.generateFile("test_input.txt", lineCount);
     
-    // inicializar semaforos
-    Initialize_semaphores();
+    FileManager fileMgr;
+    Statistics stats;
+    SemaphoreCoordinator coordinator(workerCount);
+    BenchmarkExecutor executor(&fileMgr, &stats, workerCount);
     
-    // crear tabla de resultados
-    cout << "=============================================================================" << endl;
-    cout << "|     Implementacion       | Lineas  | Tokens  | Tiempo  |" << endl;
-    cout << "|                          |Proces.  |Encontr. |  (ms)   |" << endl;
-    cout << "|--------------------------|---------|---------|---------|" << endl;
+    SemaphoreStrategy semStrategy(&fileMgr, &stats, workerCount, &coordinator);
+    MutexStrategy mutexStrategy(&fileMgr, &stats, workerCount);
+    UnsafeStrategy unsafeStrategy(&fileMgr, &stats, workerCount);
     
-    // ejecutar pruebas
-    Run_test(Tokenize_Semaphore, "Con Semaforos");
-    Run_test(Tokenize_Mutex, "Con Mutex");
-    Run_test(Tokenize_Unsafe, "Sin Sincronizacion");
+    executor.runBenchmark(&semStrategy, "Con Semaforos");
+    executor.runBenchmark(&mutexStrategy, "Con Mutex");
+    executor.runBenchmark(&unsafeStrategy, "Sin Sincronizacion");
     
-    cout << "=============================================================================" << endl;
-    cout << "\nanalisis de resultados:" << endl;
-    cout << "- implementaciones thread-safe garantizan resultados correctos" << endl;
-    cout << "- implementacion unsafe puede mostrar race conditions" << endl;
-    cout << "- semaforos permiten acceso secuencial ordenado" << endl;
-    cout << "- mutex permite acceso exclusivo pero sin orden garantizado" << endl;
-    cout << "\nnotas sobre thread safety:" << endl;
-    cout << "1. race conditions ocurren cuando threads acceden simultaneamente" << endl;
-    cout << "2. sincronizacion agrega overhead pero garantiza correctness" << endl;
-    cout << "3. semaforos vs mutex: diferentes estrategias de coordinacion" << endl;
-    
-    // limpiar recursos
-    Cleanup_semaphores();
-    pthread_mutex_destroy(&file_mutex);
-    pthread_mutex_destroy(&stats_mutex);
-    if (input_file) fclose(input_file);
+    presenter.showFooter();
     
     return 0;
 }
